@@ -24,27 +24,27 @@ export class User {
   @Column({ name: 'full_name', length: 255 })
   fullName: string;
 
-  @Column({ length: 20, nullable: true })
+  @Column({ type: 'varchar', length: 20, nullable: true })
   phone: string | null;
 
-  @Column({ type: 'enum', enum: UserRole, default: UserRole.TECHNICIAN })
+  @Column({ type: 'varchar', length: 30, default: UserRole.TECHNICIAN })
   role: UserRole;
 
   @Column({ name: 'is_active', default: true })
   isActive: boolean;
 
-  @Column({ name: 'last_login_at', type: 'timestamptz', nullable: true })
+  @Column({ name: 'last_login_at', type: 'datetime', nullable: true })
   lastLoginAt: Date | null;
 
   @Column({ default: 1 })
   version: number;
 
-  @CreateDateColumn({ name: 'created_at', type: 'timestamptz' })
+  @CreateDateColumn({ name: 'created_at' })
   createdAt: Date;
 
-  @UpdateDateColumn({ name: 'updated_at', type: 'timestamptz' })
+  @UpdateDateColumn({ name: 'updated_at' })
   updatedAt: Date;
 
-  @DeleteDateColumn({ name: 'deleted_at', type: 'timestamptz' })
+  @DeleteDateColumn({ name: 'deleted_at' })
   deletedAt: Date | null;
 }

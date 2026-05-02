@@ -13,7 +13,7 @@ import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
 import { UserRole } from '../../common/enums';
 
-interface TokenPair {
+export interface TokenPair {
   accessToken: string;
   refreshToken: string;
   expiresIn: string;

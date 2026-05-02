@@ -1,0 +1,81 @@
+name: Build & Release AAB
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'       # Triggers on version tags like v1.0.0
+  workflow_dispatch:   # Allow manual trigger from GitHub Actions UI
+
+jobs:
+  build:
+    name: Build Release AAB
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Checkout ───────────────────────────────────────────────────────
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ── 2. Java (required by Gradle/Android) ──────────────────────────────
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: '17'
+
+      # ── 3. Flutter SDK ────────────────────────────────────────────────────
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.19.6'
+          channel: stable
+          cache: true
+
+      # ── 4. Dependencies & code generation ────────────────────────────────
+      - name: Get Flutter dependencies
+        working-directory: mobile
+        run: flutter pub get
+
+      - name: Generate code (drift, freezed, riverpod)
+        working-directory: mobile
+        run: dart run build_runner build --delete-conflicting-outputs
+
+      # ── 5. Decode & write the keystore from GitHub Secrets ────────────────
+      - name: Decode keystore
+        run: |
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 --decode > mobile/android/app/keystore.jks
+
+      - name: Create key.properties
+        run: |
+          cat > mobile/android/key.properties <<EOF
+          storePassword=${{ secrets.KEY_STORE_PASSWORD }}
+          keyPassword=${{ secrets.KEY_PASSWORD }}
+          keyAlias=${{ secrets.KEY_ALIAS }}
+          storeFile=keystore.jks
+          EOF
+
+      # ── 6. Build release AAB ──────────────────────────────────────────────
+      - name: Build release AAB
+        working-directory: mobile
+        run: |
+          flutter build appbundle \
+            --release \
+            --dart-define=API_BASE_URL=${{ secrets.API_BASE_URL }}
+
+      # ── 7. Upload AAB as artifact ─────────────────────────────────────────
+      - name: Upload AAB artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: car-workshop-release-aab
+          path: mobile/build/app/outputs/bundle/release/app-release.aab
+          retention-days: 30
+
+      # ── 8. Publish to Play Store (Internal track) ─────────────────────────
+      - name: Upload to Play Store (Internal Testing)
+        uses: r0adkll/upload-google-play@v1
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.PLAY_STORE_SERVICE_ACCOUNT_JSON }}
+          packageName: com.carworkshop.management
+          releaseFiles: mobile/build/app/outputs/bundle/release/app-release.aab
+          track: internal          # Change to 'alpha', 'beta', or 'production' when ready
+          status: completed

@@ -16,10 +16,10 @@ export class InvoiceLineItem {
   @Column({ name: 'garage_id' })
   garageId: string;
 
-  @Column({ name: 'task_id', nullable: true })
+  @Column({ name: 'task_id', type: 'text', nullable: true })
   taskId: string | null;
 
-  @Column({ name: 'spare_part_id', nullable: true })
+  @Column({ name: 'spare_part_id', type: 'text', nullable: true })
   sparePartId: string | null;
 
   @Column({ name: 'item_type', type: 'varchar', length: 20 })
@@ -28,10 +28,10 @@ export class InvoiceLineItem {
   @Column({ length: 500 })
   description: string;
 
-  @Column({ type: 'decimal', precision: 10, scale: 3, default: 1 })
+  @Column({ type: 'real', default: 1 })
   quantity: number;
 
-  @Column({ name: 'unit_price', type: 'decimal', precision: 12, scale: 2 })
+  @Column({ name: 'unit_price', type: 'real' })
   unitPrice: number;
 
   @Column({ name: 'sort_order', default: 0 })
@@ -41,6 +41,6 @@ export class InvoiceLineItem {
   @JoinColumn({ name: 'invoice_id' })
   invoice: Invoice;
 
-  @CreateDateColumn({ name: 'created_at', type: 'timestamptz' })
+  @CreateDateColumn({ name: 'created_at' })
   createdAt: Date;
 }

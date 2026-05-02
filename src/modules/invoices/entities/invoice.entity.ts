@@ -26,55 +26,55 @@ export class Invoice {
   @Index()
   customerId: string;
 
-  @Column({ type: 'enum', enum: InvoiceStatus, default: InvoiceStatus.DRAFT })
+  @Column({ type: 'varchar', length: 30, default: InvoiceStatus.DRAFT })
   @Index()
   status: InvoiceStatus;
 
-  @Column({ type: 'decimal', precision: 12, scale: 2, default: 0 })
+  @Column({ type: 'real', default: 0 })
   subtotal: number;
 
-  @Column({ name: 'discount_pct', type: 'decimal', precision: 5, scale: 2, default: 0 })
+  @Column({ name: 'discount_pct', type: 'real', default: 0 })
   discountPct: number;
 
-  @Column({ name: 'discount_amount', type: 'decimal', precision: 12, scale: 2, default: 0 })
+  @Column({ name: 'discount_amount', type: 'real', default: 0 })
   discountAmount: number;
 
-  @Column({ name: 'tax_pct', type: 'decimal', precision: 5, scale: 2, default: 0 })
+  @Column({ name: 'tax_pct', type: 'real', default: 0 })
   taxPct: number;
 
-  @Column({ name: 'tax_amount', type: 'decimal', precision: 12, scale: 2, default: 0 })
+  @Column({ name: 'tax_amount', type: 'real', default: 0 })
   taxAmount: number;
 
-  @Column({ type: 'decimal', precision: 12, scale: 2, default: 0 })
+  @Column({ type: 'real', default: 0 })
   total: number;
 
   @Column({ type: 'text', nullable: true })
   notes: string | null;
 
-  @Column({ name: 'issued_at', type: 'timestamptz', nullable: true })
+  @Column({ name: 'issued_at', type: 'datetime', nullable: true })
   issuedAt: Date | null;
 
-  @Column({ name: 'due_at', type: 'timestamptz', nullable: true })
+  @Column({ name: 'due_at', type: 'datetime', nullable: true })
   dueAt: Date | null;
 
-  @Column({ name: 'paid_at', type: 'timestamptz', nullable: true })
+  @Column({ name: 'paid_at', type: 'datetime', nullable: true })
   paidAt: Date | null;
 
   @Column({ default: 1 })
   version: number;
 
-  @Column({ name: 'created_by_id', nullable: true })
+  @Column({ name: 'created_by_id', type: 'text', nullable: true })
   createdById: string | null;
 
   @OneToMany(() => InvoiceLineItem, (item) => item.invoice, { cascade: true, eager: true })
   lineItems: InvoiceLineItem[];
 
-  @CreateDateColumn({ name: 'created_at', type: 'timestamptz' })
+  @CreateDateColumn({ name: 'created_at' })
   createdAt: Date;
 
-  @UpdateDateColumn({ name: 'updated_at', type: 'timestamptz' })
+  @UpdateDateColumn({ name: 'updated_at' })
   updatedAt: Date;
 
-  @DeleteDateColumn({ name: 'deleted_at', type: 'timestamptz' })
+  @DeleteDateColumn({ name: 'deleted_at' })
   deletedAt: Date | null;
 }

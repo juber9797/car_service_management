@@ -15,43 +15,39 @@
  */
 
 import { Injectable } from '@nestjs/common';
-import { DataSource } from 'typeorm';
-
-export interface Tombstone {
-  entityType: string;
-  entityId:   string;
-  deletedAt:  Date;
-}
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository, MoreThan } from 'typeorm';
+import { Tombstone } from './entities/tombstone.entity';
 
 @Injectable()
 export class TombstoneService {
-  constructor(private readonly dataSource: DataSource) {}
+  constructor(
+    @InjectRepository(Tombstone)
+    private readonly repo: Repository<Tombstone>,
+  ) {}
 
   async write(entityType: string, entityId: string, garageId: string): Promise<void> {
-    await this.dataSource.query(
-      `INSERT INTO tombstones(garage_id, entity_type, entity_id, deleted_at)
-       VALUES ($1, $2, $3, NOW())
-       ON CONFLICT (entity_type, entity_id) DO UPDATE SET deleted_at = NOW()`,
-      [garageId, entityType, entityId],
+    await this.repo.upsert(
+      { garageId, entityType, entityId, deletedAt: new Date() },
+      { conflictPaths: ['entityType', 'entityId'] },
     );
   }
 
   async getSince(garageId: string, since: Date): Promise<Tombstone[]> {
-    return this.dataSource.query<Tombstone[]>(
-      `SELECT entity_type AS "entityType", entity_id AS "entityId", deleted_at AS "deletedAt"
-       FROM tombstones
-       WHERE garage_id = $1 AND deleted_at > $2
-       ORDER BY deleted_at ASC`,
-      [garageId, since],
-    );
+    return this.repo.find({
+      where: { garageId, deletedAt: MoreThan(since) },
+      order: { deletedAt: 'ASC' },
+    });
   }
 
   /** Prune tombstones older than 90 days — run as a nightly cron */
   async prune(): Promise<number> {
-    const result = await this.dataSource.query<[{ count: string }]>(
-      `DELETE FROM tombstones WHERE deleted_at < NOW() - INTERVAL '90 days'
-       RETURNING 1`,
-    );
-    return result.length;
+    const cutoff = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000);
+    const result = await this.repo
+      .createQueryBuilder()
+      .delete()
+      .where('deleted_at < :cutoff', { cutoff: cutoff.toISOString() })
+      .execute();
+    return result.affected ?? 0;
   }
 }

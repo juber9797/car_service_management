@@ -14,18 +14,18 @@ export class TaskStatusHistory {
   @Column({ name: 'garage_id' })
   garageId: string;
 
-  @Column({ name: 'from_status', type: 'enum', enum: TaskStatus, nullable: true })
+  @Column({ name: 'from_status', type: 'varchar', length: 30, nullable: true })
   fromStatus: TaskStatus | null;
 
-  @Column({ name: 'to_status', type: 'enum', enum: TaskStatus })
+  @Column({ name: 'to_status', type: 'varchar', length: 30 })
   toStatus: TaskStatus;
 
-  @Column({ name: 'changed_by_id', nullable: true })
+  @Column({ name: 'changed_by_id', type: 'text', nullable: true })
   changedById: string | null;
 
   @Column({ type: 'text', nullable: true })
   notes: string | null;
 
-  @CreateDateColumn({ name: 'created_at', type: 'timestamptz' })
+  @CreateDateColumn({ name: 'created_at' })
   createdAt: Date;
 }

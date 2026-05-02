@@ -1,5 +1,10 @@
 abstract class AppConstants {
-  static const String baseUrl = 'http://10.0.2.2:3000/api/v1'; // Android emulator localhost
+  // Set via --dart-define=API_BASE_URL=https://your-server.com/api/v1 at build time.
+  // Falls back to the Android emulator address for local debug builds.
+  static const String baseUrl = String.fromEnvironment(
+    'API_BASE_URL',
+    defaultValue: 'http://10.0.2.2:3000/api/v1',
+  );
   static const String tokenKey = 'access_token';
   static const String refreshTokenKey = 'refresh_token';
   static const String garageIdKey = 'garage_id';

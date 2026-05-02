@@ -13,8 +13,8 @@ async function bootstrap(): Promise<void> {
   const port = config.get<number>('app.port')!;
   const prefix = config.get<string>('app.apiPrefix')!;
 
-  // Global route prefix
-  app.setGlobalPrefix(prefix);
+  // Global route prefix — exclude the Swagger UI paths so /docs still works
+  app.setGlobalPrefix(prefix, { exclude: ['docs', 'docs-json', 'docs-yaml'] });
 
   // Strict validation — strip unknown fields, whitelist only
   app.useGlobalPipes(

@@ -4,7 +4,7 @@ import {
   Logger,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, DataSource } from 'typeorm';
+import { Repository, DataSource, MoreThan } from 'typeorm';
 import { JobCard } from '../job-cards/entities/job-card.entity';
 import { Task } from '../tasks/entities/task.entity';
 import { PushSyncDto, SyncChangeDto } from './dto/push-sync.dto';
@@ -26,7 +26,7 @@ export interface ChangeResult {
   entityType:    string;
   resolution:    ConflictResolution;
   serverVersion?: number;
-  serverState?:   Record<string, unknown>;  // returned on merge/reject so client can reconcile
+  serverState?:   Record<string, unknown>;
   conflict?: {
     reason:      string;
     fields?:     string[];
@@ -102,7 +102,7 @@ export class SyncService {
   }
 
   // =====================================================================
-  // PULL — returns changes + tombstones since cursor
+  // PULL — queries entities directly by updatedAt; no sync_log trigger needed
   // =====================================================================
 
   async pull(dto: PullSyncDto, user: JwtPayload): Promise<PullSyncResponse> {
@@ -116,47 +116,63 @@ export class SyncService {
       throw new BadRequestException(`Unknown entity types: ${invalidTypes.join(', ')}`);
     }
 
-    // Fetch entity changes + tombstones in parallel
-    const [rows, tombstones] = await Promise.all([
-      this.dataSource.query<Array<{
-        entity_type: string; entity_id: string; operation: SyncOperation;
-        version: number; server_time: Date; payload: Record<string, unknown>;
-      }>>(
-        `SELECT DISTINCT ON (entity_type, entity_id)
-           entity_type, entity_id, operation, version, server_time, payload
-         FROM sync_log
-         WHERE garage_id   = $1
-           AND server_time > $2
-           AND entity_type = ANY($3)
-         ORDER BY entity_type, entity_id, server_time DESC
-         LIMIT $4`,
-        [user.garageId, since, requestedTypes, PULL_PAGE_SIZE + 1],
-      ),
+    const includeJobCards = requestedTypes.includes('job_cards');
+    const includeTasks    = requestedTypes.includes('tasks');
+
+    const [jobCards, tasks, tombstones] = await Promise.all([
+      includeJobCards
+        ? this.jobCardRepo.find({
+            where: { garageId: user.garageId, updatedAt: MoreThan(since) },
+            withDeleted: true,
+            order: { updatedAt: 'ASC' },
+            take: PULL_PAGE_SIZE + 1,
+          })
+        : Promise.resolve([] as JobCard[]),
+      includeTasks
+        ? this.taskRepo.find({
+            where: { garageId: user.garageId, updatedAt: MoreThan(since) },
+            withDeleted: true,
+            order: { updatedAt: 'ASC' },
+            take: PULL_PAGE_SIZE + 1,
+          })
+        : Promise.resolve([] as Task[]),
       this.tombstoneService.getSince(user.garageId, since),
     ]);
 
-    const hasMore = rows.length > PULL_PAGE_SIZE;
-    const slice   = hasMore ? rows.slice(0, PULL_PAGE_SIZE) : rows;
+    // Merge both streams, sort by updatedAt ascending, then paginate
+    const allChanges: SyncedEntity[] = [
+      ...jobCards.map((jc) => ({
+        entityType: 'job_cards',
+        entityId:   jc.id,
+        operation:  jc.deletedAt ? SyncOperation.DELETE : SyncOperation.UPDATE,
+        version:    jc.version,
+        serverTime: jc.updatedAt,
+        payload:    jc as unknown as Record<string, unknown>,
+      })),
+      ...tasks.map((t) => ({
+        entityType: 'tasks',
+        entityId:   t.id,
+        operation:  t.deletedAt ? SyncOperation.DELETE : SyncOperation.UPDATE,
+        version:    t.version,
+        serverTime: t.updatedAt,
+        payload:    t as unknown as Record<string, unknown>,
+      })),
+    ]
+      .sort((a, b) => (a.serverTime as unknown as Date).getTime() - (b.serverTime as unknown as Date).getTime())
+      .map((c) => ({
+        ...c,
+        serverTime: (c.serverTime as unknown as Date).toISOString(),
+      }));
 
-    const changes: SyncedEntity[] = slice.map((row) => ({
-      entityType: row.entity_type,
-      entityId:   row.entity_id,
-      operation:  row.operation,
-      version:    row.version,
-      serverTime: row.server_time.toISOString(),
-      payload:    row.payload,
-    }));
-
+    const hasMore  = allChanges.length > PULL_PAGE_SIZE;
+    const slice    = hasMore ? allChanges.slice(0, PULL_PAGE_SIZE) : allChanges;
     const nextCursor = hasMore && slice.length > 0
-      ? slice[slice.length - 1].server_time.toISOString()
+      ? slice[slice.length - 1].serverTime
       : null;
 
     return {
-      changes,
-      tombstones: tombstones.map((t) => ({
-        entityType: t.entityType,
-        entityId:   t.entityId,
-      })),
+      changes:    slice,
+      tombstones: tombstones.map((t) => ({ entityType: t.entityType, entityId: t.entityId })),
       serverTime: new Date().toISOString(),
       hasMore,
       nextCursor,
@@ -172,26 +188,26 @@ export class SyncService {
     clientId: string,
     user:     JwtPayload,
   ): Promise<ChangeResult> {
+    // Typed as a wide repo so TypeScript accepts findOne/create calls on either entity
+    type AnyEntity = { id: string; garageId: string; version: number; [k: string]: unknown };
+
     try {
       return await this.dataSource.transaction(async (manager) => {
-        const repo = change.entityType === 'job_cards'
+        const repo = (change.entityType === 'job_cards'
           ? manager.getRepository(JobCard)
-          : manager.getRepository(Task);
+          : manager.getRepository(Task)) as unknown as import('typeorm').Repository<AnyEntity>;
 
         // ── CREATE ────────────────────────────────────────────────────────
         if (change.operation === SyncOperation.CREATE) {
-          const existing = await repo.findOne({
-            where: { id: change.entityId } as Parameters<typeof repo.findOne>[0],
-          });
+          const existing = await repo.findOne({ where: { id: change.entityId } });
 
-          // Idempotent: already exists → return success without re-inserting
           if (existing) {
             return {
               changeId:      change.changeId,
               entityId:      change.entityId,
               entityType:    change.entityType,
-              resolution:    'accepted',
-              serverVersion: (existing as { version: number }).version,
+              resolution:    'accepted' as const,
+              serverVersion: existing.version,
             };
           }
 
@@ -201,40 +217,35 @@ export class SyncService {
             garageId: user.garageId,
             clientId,
             version:  1,
-          } as Parameters<typeof repo.create>[0]);
+          });
 
           const saved = await manager.save(entity);
           return {
             changeId:      change.changeId,
             entityId:      change.entityId,
             entityType:    change.entityType,
-            resolution:    'accepted',
-            serverVersion: (saved as { version: number }).version,
+            resolution:    'accepted' as const,
+            serverVersion: (saved as AnyEntity).version,
           };
         }
 
         // ── UPDATE ────────────────────────────────────────────────────────
         if (change.operation === SyncOperation.UPDATE) {
-          const current = await repo
-            .createQueryBuilder('e')
-            .where('e.id = :id AND e.garage_id = :gid', {
-              id:  change.entityId,
-              gid: user.garageId,
-            })
-            .setLock('pessimistic_write')
-            .getOne();
+          // SQLite serialises writes within a transaction — no row lock needed
+          const current = await repo.findOne({
+            where: { id: change.entityId, garageId: user.garageId },
+          });
 
           if (!current) {
             return {
               changeId:   change.changeId,
               entityId:   change.entityId,
               entityType: change.entityType,
-              resolution: 'rejected',
+              resolution: 'rejected' as const,
               conflict:   { reason: 'Entity not found on server' },
             };
           }
 
-          // Delegate to ConflictResolver
           const mergeResult = change.entityType === 'job_cards'
             ? this.resolver.resolveJobCard(
                 current as unknown as Parameters<typeof this.resolver.resolveJobCard>[0],
@@ -254,18 +265,17 @@ export class SyncService {
               changeId:    change.changeId,
               entityId:    change.entityId,
               entityType:  change.entityType,
-              resolution:  'rejected',
-              serverState: current as unknown as Record<string, unknown>,
+              resolution:  'rejected' as const,
+              serverState: current as Record<string, unknown>,
               conflict:    { reason: mergeResult.reason },
             };
           }
 
-          // Apply merged fields
           Object.assign(current, mergeResult.merged, {
             clientId,
-            version: (current as { version: number }).version + 1,
+            version: current.version + 1,
           });
-          const saved = await manager.save(current);
+          const saved = await manager.save(current) as AnyEntity;
 
           const resolution: ConflictResolution =
             mergeResult.outcome === 'merged' ? 'merged' : 'accepted';
@@ -275,21 +285,21 @@ export class SyncService {
             entityId:      change.entityId,
             entityType:    change.entityType,
             resolution,
-            serverVersion: (saved as { version: number }).version,
-            serverState:   saved as unknown as Record<string, unknown>,
+            serverVersion: saved.version,
+            serverState:   saved as Record<string, unknown>,
             ...(mergeResult.outcome === 'merged' && {
-              conflict: { fields: mergeResult.conflictFields },
+              conflict: {
+                reason: 'Field-level merge applied',
+                fields: mergeResult.conflictFields,
+              },
             }),
           };
         }
 
         // ── DELETE ────────────────────────────────────────────────────────
         if (change.operation === SyncOperation.DELETE) {
-          const current = await repo.findOne({
-            where: { id: change.entityId } as Parameters<typeof repo.findOne>[0],
-          });
+          const current = await repo.findOne({ where: { id: change.entityId } });
 
-          // Already gone — idempotent
           if (!current) {
             return {
               changeId:   change.changeId,
@@ -299,9 +309,6 @@ export class SyncService {
             };
           }
 
-          // Safety rule: updates beat deletes.
-          // If server version advanced past client's base, an update happened
-          // after the client issued the delete — reject the delete.
           const serverVersion = (current as { version: number }).version;
           if (change.baseVersion < serverVersion) {
             return {
@@ -317,10 +324,9 @@ export class SyncService {
             };
           }
 
-          // Safety rule: never delete an in-progress job card
           if (
             change.entityType === 'job_cards' &&
-            (current as JobCard).status === JobCardStatus.IN_PROGRESS
+            (current as unknown as JobCard).status === JobCardStatus.IN_PROGRESS
           ) {
             return {
               changeId:    change.changeId,
@@ -336,7 +342,9 @@ export class SyncService {
             change.entityType === 'job_cards' ? JobCard : Task,
             change.entityId,
           );
-          // Tombstone is written automatically by the DB trigger
+
+          // Write tombstone so offline clients can purge their local copy
+          await this.tombstoneService.write(change.entityType, change.entityId, user.garageId);
 
           return {
             changeId:   change.changeId,

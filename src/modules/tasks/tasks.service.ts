@@ -78,11 +78,10 @@ export class TasksService {
     user: JwtPayload,
   ): Promise<Task> {
     return this.dataSource.transaction(async (manager) => {
-      const task = await manager
-        .createQueryBuilder(Task, 't')
-        .where('t.id = :id AND t.garage_id = :garageId', { id, garageId: user.garageId })
-        .setLock('pessimistic_write')
-        .getOne();
+      // SQLite serialises writes within a transaction — no explicit row lock needed
+      const task = await manager.findOne(Task, {
+        where: { id, garageId: user.garageId },
+      });
 
       if (!task) throw new NotFoundException(`Task ${id} not found`);
 

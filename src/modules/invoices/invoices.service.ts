@@ -173,7 +173,7 @@ export class InvoicesService {
 
   private async nextInvoiceNumber(garageId: string): Promise<string> {
     const [row] = await this.dataSource.query<[{ count: string }]>(
-      `SELECT COUNT(*) AS count FROM invoices WHERE garage_id = $1`,
+      `SELECT COUNT(*) AS count FROM invoices WHERE garage_id = ?`,
       [garageId],
     );
     const seq = parseInt(row.count, 10) + 1;
