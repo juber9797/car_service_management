@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mkdir -p C:/projects/car_management_app)",
+      "Read(//c/projects/**)",
+      "PowerShell(try { Invoke-RestMethod -Uri \"http://localhost:3000/api\" -TimeoutSec 3 } catch { $_.Exception.Message }; netstat -ano | findstr \":3000\")"
+    ]
+  }
+}
