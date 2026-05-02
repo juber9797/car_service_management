@@ -4,78 +4,80 @@ import {
   Logger,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, DataSource, MoreThan } from 'typeorm';
+import { Repository, DataSource } from 'typeorm';
 import { JobCard } from '../job-cards/entities/job-card.entity';
 import { Task } from '../tasks/entities/task.entity';
 import { PushSyncDto, SyncChangeDto } from './dto/push-sync.dto';
 import { PullSyncDto } from './dto/pull-sync.dto';
-import { SyncOperation, JobCardStatus, TaskStatus } from '../../common/enums';
+import { SyncOperation, JobCardStatus } from '../../common/enums';
 import { JwtPayload } from '../../common/decorators/current-user.decorator';
+import { ConflictResolver } from './conflict-resolver';
+import { TombstoneService } from './tombstone.service';
 
-// -----------------------------------------------------------------------
-// Types
-// -----------------------------------------------------------------------
+// ─────────────────────────────────────────────
+// Response types
+// ─────────────────────────────────────────────
 
 export type ConflictResolution = 'accepted' | 'rejected' | 'merged';
 
 export interface ChangeResult {
-  changeId: string;
-  entityId: string;
-  entityType: string;
-  resolution: ConflictResolution;
+  changeId:      string;
+  entityId:      string;
+  entityType:    string;
+  resolution:    ConflictResolution;
   serverVersion?: number;
+  serverState?:   Record<string, unknown>;  // returned on merge/reject so client can reconcile
   conflict?: {
-    reason: string;
-    serverState: Record<string, unknown>;
+    reason:      string;
+    fields?:     string[];
   };
 }
 
 export interface PushSyncResponse {
-  accepted: number;
-  rejected: number;
-  results: ChangeResult[];
+  accepted:   number;
+  rejected:   number;
+  merged:     number;
+  results:    ChangeResult[];
   serverTime: string;
-}
-
-export interface PullSyncResponse {
-  changes: SyncedEntity[];
-  serverTime: string;
-  hasMore: boolean;
-  nextCursor: string | null;
 }
 
 export interface SyncedEntity {
-  entityType: string;
-  entityId: string;
-  operation: SyncOperation;
-  version: number;
-  serverTime: string;
-  payload: Record<string, unknown>;
+  entityType:  string;
+  entityId:    string;
+  operation:   SyncOperation;
+  version:     number;
+  serverTime:  string;
+  payload:     Record<string, unknown>;
 }
 
-// -----------------------------------------------------------------------
-// Entity registry — maps string names to TypeORM repositories
-// -----------------------------------------------------------------------
+export interface PullSyncResponse {
+  changes:     SyncedEntity[];
+  tombstones:  Array<{ entityType: string; entityId: string }>;
+  serverTime:  string;
+  hasMore:     boolean;
+  nextCursor:  string | null;
+}
 
 const SUPPORTED_ENTITIES = new Set(['job_cards', 'tasks']);
 const PULL_PAGE_SIZE = 500;
 
 @Injectable()
 export class SyncService {
-  private readonly logger = new Logger(SyncService.name);
+  private readonly logger   = new Logger(SyncService.name);
+  private readonly resolver = new ConflictResolver();
 
   constructor(
     @InjectRepository(JobCard) private readonly jobCardRepo: Repository<JobCard>,
-    @InjectRepository(Task) private readonly taskRepo: Repository<Task>,
-    private readonly dataSource: DataSource,
+    @InjectRepository(Task)    private readonly taskRepo:    Repository<Task>,
+    private readonly dataSource:        DataSource,
+    private readonly tombstoneService:  TombstoneService,
   ) {}
 
   // =====================================================================
-  // PUSH — client uploads local changes in batch
+  // PUSH
   // =====================================================================
 
   async push(dto: PushSyncDto, user: JwtPayload): Promise<PushSyncResponse> {
-    // Validate all entity types before touching the DB
     const invalid = dto.changes.filter((c) => !SUPPORTED_ENTITIES.has(c.entityType));
     if (invalid.length > 0) {
       throw new BadRequestException(
@@ -85,23 +87,22 @@ export class SyncService {
 
     const results: ChangeResult[] = [];
 
-    // Process each change sequentially to respect ordering guarantees.
-    // A future optimisation: group by entityId, parallelise across groups.
     for (const change of dto.changes) {
       const result = await this.applyChange(change, dto.clientId, user);
       results.push(result);
     }
 
     return {
-      accepted: results.filter((r) => r.resolution === 'accepted').length,
-      rejected: results.filter((r) => r.resolution === 'rejected').length,
+      accepted:   results.filter((r) => r.resolution === 'accepted').length,
+      rejected:   results.filter((r) => r.resolution === 'rejected').length,
+      merged:     results.filter((r) => r.resolution === 'merged').length,
       results,
       serverTime: new Date().toISOString(),
     };
   }
 
   // =====================================================================
-  // PULL — client fetches everything changed since a cursor
+  // PULL — returns changes + tombstones since cursor
   // =====================================================================
 
   async pull(dto: PullSyncDto, user: JwtPayload): Promise<PullSyncResponse> {
@@ -115,52 +116,47 @@ export class SyncService {
       throw new BadRequestException(`Unknown entity types: ${invalidTypes.join(', ')}`);
     }
 
-    // Pull from sync_log — a single source of truth for all mutations.
-    // The sync_log trigger writes every insert/update there automatically.
-    const rows = await this.dataSource.query<Array<{
-      entity_type: string;
-      entity_id: string;
-      operation: SyncOperation;
-      version: number;
-      server_time: Date;
-      payload: Record<string, unknown>;
-    }>>(
-      `
-      SELECT DISTINCT ON (entity_type, entity_id)
-        entity_type,
-        entity_id,
-        operation,
-        version,
-        server_time,
-        payload
-      FROM sync_log
-      WHERE garage_id   = $1
-        AND server_time > $2
-        AND entity_type = ANY($3)
-      ORDER BY entity_type, entity_id, server_time DESC
-      LIMIT $4
-      `,
-      [user.garageId, since, requestedTypes, PULL_PAGE_SIZE + 1],
-    );
+    // Fetch entity changes + tombstones in parallel
+    const [rows, tombstones] = await Promise.all([
+      this.dataSource.query<Array<{
+        entity_type: string; entity_id: string; operation: SyncOperation;
+        version: number; server_time: Date; payload: Record<string, unknown>;
+      }>>(
+        `SELECT DISTINCT ON (entity_type, entity_id)
+           entity_type, entity_id, operation, version, server_time, payload
+         FROM sync_log
+         WHERE garage_id   = $1
+           AND server_time > $2
+           AND entity_type = ANY($3)
+         ORDER BY entity_type, entity_id, server_time DESC
+         LIMIT $4`,
+        [user.garageId, since, requestedTypes, PULL_PAGE_SIZE + 1],
+      ),
+      this.tombstoneService.getSince(user.garageId, since),
+    ]);
 
     const hasMore = rows.length > PULL_PAGE_SIZE;
-    const slice = hasMore ? rows.slice(0, PULL_PAGE_SIZE) : rows;
+    const slice   = hasMore ? rows.slice(0, PULL_PAGE_SIZE) : rows;
 
     const changes: SyncedEntity[] = slice.map((row) => ({
       entityType: row.entity_type,
-      entityId: row.entity_id,
-      operation: row.operation,
-      version: row.version,
+      entityId:   row.entity_id,
+      operation:  row.operation,
+      version:    row.version,
       serverTime: row.server_time.toISOString(),
-      payload: row.payload,
+      payload:    row.payload,
     }));
 
     const nextCursor = hasMore && slice.length > 0
-      ? slice[slice.length - 1].serverTime.toISOString()
+      ? slice[slice.length - 1].server_time.toISOString()
       : null;
 
     return {
       changes,
+      tombstones: tombstones.map((t) => ({
+        entityType: t.entityType,
+        entityId:   t.entityId,
+      })),
       serverTime: new Date().toISOString(),
       hasMore,
       nextCursor,
@@ -168,62 +164,61 @@ export class SyncService {
   }
 
   // =====================================================================
-  // Private: apply a single change with conflict detection
+  // Private: apply a single change
   // =====================================================================
 
   private async applyChange(
-    change: SyncChangeDto,
+    change:   SyncChangeDto,
     clientId: string,
-    user: JwtPayload,
+    user:     JwtPayload,
   ): Promise<ChangeResult> {
     try {
       return await this.dataSource.transaction(async (manager) => {
-        const repo =
-          change.entityType === 'job_cards'
-            ? manager.getRepository(JobCard)
-            : manager.getRepository(Task);
+        const repo = change.entityType === 'job_cards'
+          ? manager.getRepository(JobCard)
+          : manager.getRepository(Task);
 
-        // ---------- CREATE ----------
+        // ── CREATE ────────────────────────────────────────────────────────
         if (change.operation === SyncOperation.CREATE) {
           const existing = await repo.findOne({
             where: { id: change.entityId } as Parameters<typeof repo.findOne>[0],
           });
 
+          // Idempotent: already exists → return success without re-inserting
           if (existing) {
-            // Idempotent — already exists, treat as success
             return {
-              changeId: change.changeId,
-              entityId: change.entityId,
-              entityType: change.entityType,
-              resolution: 'accepted' as ConflictResolution,
+              changeId:      change.changeId,
+              entityId:      change.entityId,
+              entityType:    change.entityType,
+              resolution:    'accepted',
               serverVersion: (existing as { version: number }).version,
             };
           }
 
           const entity = repo.create({
             ...change.payload,
-            id: change.entityId,
+            id:       change.entityId,
             garageId: user.garageId,
             clientId,
-            version: 1,
+            version:  1,
           } as Parameters<typeof repo.create>[0]);
 
           const saved = await manager.save(entity);
           return {
-            changeId: change.changeId,
-            entityId: change.entityId,
-            entityType: change.entityType,
-            resolution: 'accepted',
+            changeId:      change.changeId,
+            entityId:      change.entityId,
+            entityType:    change.entityType,
+            resolution:    'accepted',
             serverVersion: (saved as { version: number }).version,
           };
         }
 
-        // ---------- UPDATE ----------
+        // ── UPDATE ────────────────────────────────────────────────────────
         if (change.operation === SyncOperation.UPDATE) {
           const current = await repo
             .createQueryBuilder('e')
             .where('e.id = :id AND e.garage_id = :gid', {
-              id: change.entityId,
+              id:  change.entityId,
               gid: user.garageId,
             })
             .setLock('pessimistic_write')
@@ -231,95 +226,109 @@ export class SyncService {
 
           if (!current) {
             return {
-              changeId: change.changeId,
-              entityId: change.entityId,
+              changeId:   change.changeId,
+              entityId:   change.entityId,
               entityType: change.entityType,
               resolution: 'rejected',
-              conflict: { reason: 'Entity not found', serverState: {} },
+              conflict:   { reason: 'Entity not found on server' },
             };
           }
 
-          const serverVersion = (current as { version: number }).version;
+          // Delegate to ConflictResolver
+          const mergeResult = change.entityType === 'job_cards'
+            ? this.resolver.resolveJobCard(
+                current as unknown as Parameters<typeof this.resolver.resolveJobCard>[0],
+                change.payload ?? {},
+                change.baseVersion,
+                new Date(change.localTimestamp),
+              )
+            : this.resolver.resolveTask(
+                current as unknown as Parameters<typeof this.resolver.resolveTask>[0],
+                change.payload ?? {},
+                change.baseVersion,
+                new Date(change.localTimestamp),
+              );
 
-          if (change.baseVersion < serverVersion) {
-            // Conflict: server moved past the client's base.
-            // Strategy: field-level merge where client wins on non-status fields,
-            // server wins on status (status is authoritative).
-            const merged = this.mergeConflict(current, change, change.entityType);
-
-            if (merged === null) {
-              // Irreconcilable — reject the change
-              return {
-                changeId: change.changeId,
-                entityId: change.entityId,
-                entityType: change.entityType,
-                resolution: 'rejected',
-                conflict: {
-                  reason: `Version conflict: base=${change.baseVersion} server=${serverVersion}`,
-                  serverState: current as unknown as Record<string, unknown>,
-                },
-              };
-            }
-
-            Object.assign(current, merged, {
-              clientId,
-              version: serverVersion + 1,
-            });
-            const saved = await manager.save(current);
+          if (mergeResult.outcome === 'rejected') {
             return {
-              changeId: change.changeId,
-              entityId: change.entityId,
-              entityType: change.entityType,
-              resolution: 'merged',
-              serverVersion: (saved as { version: number }).version,
+              changeId:    change.changeId,
+              entityId:    change.entityId,
+              entityType:  change.entityType,
+              resolution:  'rejected',
+              serverState: current as unknown as Record<string, unknown>,
+              conflict:    { reason: mergeResult.reason },
             };
           }
 
-          // No conflict — apply cleanly
-          Object.assign(current, change.payload, {
+          // Apply merged fields
+          Object.assign(current, mergeResult.merged, {
             clientId,
-            version: serverVersion + 1,
+            version: (current as { version: number }).version + 1,
           });
           const saved = await manager.save(current);
+
+          const resolution: ConflictResolution =
+            mergeResult.outcome === 'merged' ? 'merged' : 'accepted';
+
           return {
-            changeId: change.changeId,
-            entityId: change.entityId,
-            entityType: change.entityType,
-            resolution: 'accepted',
+            changeId:      change.changeId,
+            entityId:      change.entityId,
+            entityType:    change.entityType,
+            resolution,
             serverVersion: (saved as { version: number }).version,
+            serverState:   saved as unknown as Record<string, unknown>,
+            ...(mergeResult.outcome === 'merged' && {
+              conflict: { fields: mergeResult.conflictFields },
+            }),
           };
         }
 
-        // ---------- DELETE ----------
+        // ── DELETE ────────────────────────────────────────────────────────
         if (change.operation === SyncOperation.DELETE) {
           const current = await repo.findOne({
             where: { id: change.entityId } as Parameters<typeof repo.findOne>[0],
           });
 
+          // Already gone — idempotent
           if (!current) {
-            // Already gone — idempotent success
             return {
-              changeId: change.changeId,
-              entityId: change.entityId,
+              changeId:   change.changeId,
+              entityId:   change.entityId,
               entityType: change.entityType,
               resolution: 'accepted',
             };
           }
 
-          // Reject delete if a job card is in_progress
+          // Safety rule: updates beat deletes.
+          // If server version advanced past client's base, an update happened
+          // after the client issued the delete — reject the delete.
+          const serverVersion = (current as { version: number }).version;
+          if (change.baseVersion < serverVersion) {
+            return {
+              changeId:    change.changeId,
+              entityId:    change.entityId,
+              entityType:  change.entityType,
+              resolution:  'rejected',
+              serverState: current as unknown as Record<string, unknown>,
+              conflict: {
+                reason: `Delete rejected: entity was updated after your offline session ` +
+                        `(base v${change.baseVersion}, server v${serverVersion})`,
+              },
+            };
+          }
+
+          // Safety rule: never delete an in-progress job card
           if (
             change.entityType === 'job_cards' &&
             (current as JobCard).status === JobCardStatus.IN_PROGRESS
           ) {
             return {
-              changeId: change.changeId,
-              entityId: change.entityId,
-              entityType: change.entityType,
-              resolution: 'rejected',
-              conflict: {
-                reason: 'Cannot delete an in-progress job card',
-                serverState: current as unknown as Record<string, unknown>,
-              },
+              changeId:    change.changeId,
+              entityId:    change.entityId,
+              entityType:  change.entityType,
+              resolution:  'rejected',
+              serverState: current as unknown as Record<string, unknown>,
+              conflict:    { reason: 'Cannot delete an in-progress job card' },
             };
           }
 
@@ -327,9 +336,11 @@ export class SyncService {
             change.entityType === 'job_cards' ? JobCard : Task,
             change.entityId,
           );
+          // Tombstone is written automatically by the DB trigger
+
           return {
-            changeId: change.changeId,
-            entityId: change.entityId,
+            changeId:   change.changeId,
+            entityId:   change.entityId,
             entityType: change.entityType,
             resolution: 'accepted',
           };
@@ -340,59 +351,12 @@ export class SyncService {
     } catch (err) {
       this.logger.error(`Failed to apply change ${change.changeId}`, err);
       return {
-        changeId: change.changeId,
-        entityId: change.entityId,
+        changeId:   change.changeId,
+        entityId:   change.entityId,
         entityType: change.entityType,
         resolution: 'rejected',
-        conflict: {
-          reason: (err as Error).message,
-          serverState: {},
-        },
+        conflict:   { reason: (err as Error).message },
       };
     }
-  }
-
-  // =====================================================================
-  // Field-level merge for conflicting updates
-  //
-  // Strategy:
-  //   - 'status' fields: server wins (status changes go through validated
-  //     state machine transitions; we don't let stale clients revert them)
-  //   - All other fields: last-write-wins (client timestamp vs server
-  //     updated_at). The client wins for notes/descriptions, etc.
-  //   - Returns null if a hard constraint would be violated.
-  // =====================================================================
-
-  private mergeConflict(
-    server: object,
-    change: SyncChangeDto,
-    entityType: string,
-  ): Partial<object> | null {
-    const clientPayload = change.payload ?? {};
-    const merged: Record<string, unknown> = {};
-
-    // Fields where server always wins regardless of timestamps
-    const serverWinsFields =
-      entityType === 'job_cards'
-        ? (['status', 'startedAt', 'completedAt'] as const)
-        : (['status', 'startedAt', 'completedAt', 'actualHours'] as const);
-
-    const clientTimestamp = new Date(change.localTimestamp).getTime();
-    const serverTimestamp = ((server as { updatedAt?: Date }).updatedAt ?? new Date()).getTime();
-
-    for (const [key, value] of Object.entries(clientPayload)) {
-      if ((serverWinsFields as readonly string[]).includes(key)) {
-        // Server wins — keep what's already on the server entity
-        merged[key] = (server as Record<string, unknown>)[key];
-      } else if (clientTimestamp > serverTimestamp) {
-        // Client change is newer — take client value
-        merged[key] = value;
-      } else {
-        // Server is newer — keep server value
-        merged[key] = (server as Record<string, unknown>)[key];
-      }
-    }
-
-    return merged;
   }
 }
